@@ -126,16 +126,17 @@ def configure_training():
     batch_size = input("\nBatch size [default: 32]: ").strip()
     batch_size = int(batch_size) if batch_size else 32
     
-    # Use GPU
-    use_gpu = input("\nUse GPU if available? (y/n) [default: y]: ").strip().lower()
-    use_gpu = use_gpu != 'n'
+    # Select device
+    device_choice = input("\nSelect device (auto, mps, cuda, cpu) [default: auto]: ").strip().lower()
+    if not device_choice:
+        device_choice = 'auto'
     
     config = {
         'model_type': model_type,
         'test_fold': test_fold,
         'num_epochs': num_epochs,
         'batch_size': batch_size,
-        'use_gpu': use_gpu
+        'device': device_choice
     }
     
     print("\nConfiguration:")
@@ -155,13 +156,14 @@ def run_training(config):
     
     from training_pipeline import train_with_curriculum, compare_all_models
     
-    device = 'cuda' if config['use_gpu'] else 'cpu'
+    device = config.get('device', 'auto')
     
     if config['model_type'] == 'ALL':
         print("Training all models for comparison...\n")
         results = compare_all_models(
             organized_dataset_dir='organized_dataset',
-            test_fold=config['test_fold']
+            test_fold=config['test_fold'],
+            device=device
         )
     else:
         print(f"Training {config['model_type']} model...\n")

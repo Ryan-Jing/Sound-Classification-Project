@@ -13,6 +13,7 @@ from pathlib import Path
 from tqdm import tqdm
 import json
 import shutil
+import warnings
 
 class AudioDatasetOrganizer:
     """
@@ -53,6 +54,7 @@ class AudioDatasetOrganizer:
             'class_mapping': {},
             'fold_distribution': {}
         }
+        self.noise_counter = 0
 
     def process_audio_file(self, audio_path, target_path):
         """
@@ -66,8 +68,13 @@ class AudioDatasetOrganizer:
             bool: Success status
         """
         try:
-            # Load audio
-            y, sr = librosa.load(audio_path, sr=self.target_sr, mono=True)
+            # Suppress librosa warnings about PySoundFile and audioread
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=UserWarning, module='librosa')
+                warnings.filterwarnings('ignore', category=FutureWarning, module='librosa')
+
+                # Load audio
+                y, sr = librosa.load(audio_path, sr=self.target_sr, mono=True)
 
             # Adjust length to target duration
             if len(y) > self.target_samples:
@@ -93,7 +100,7 @@ class AudioDatasetOrganizer:
 
     def organize_urbansound8k(self, urbansound_path):
         """
-        Process UrbanSound8K dataset maintaining fold structure.
+        Process UrbanSound8K dataset, re-classifying some sounds as noise.
 
         Args:
             urbansound_path: Path to UrbanSound8K dataset root
@@ -101,38 +108,49 @@ class AudioDatasetOrganizer:
         print("Processing UrbanSound8K dataset...")
         urbansound_path = Path(urbansound_path)
         metadata_file = urbansound_path / 'UrbanSound8K.csv'
+        noise_classes = {'air_conditioner'}
 
         if not metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
 
-        # Load metadata
         df = pd.read_csv(metadata_file)
 
-        # Update class mapping
-        for idx, row in df.iterrows():
-            class_id = row['classID']
-            class_name = row['class']
-            if class_id not in self.metadata['class_mapping']:
+        # Pre-populate class mapping
+        for class_id, class_name in df[['classID', 'class']].drop_duplicates().values:
+            if class_name not in noise_classes:
                 self.metadata['class_mapping'][class_id] = class_name
+        
+        print(f"  Re-classifying {noise_classes} as noise.")
 
-        # Process each audio file
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="UrbanSound8K"):
             fold = row['fold']
             filename = row['slice_file_name']
             class_id = row['classID']
             class_name = row['class']
-
-            # Source and target paths
             source_path = urbansound_path / f'fold{fold}' / filename
-            target_filename = f"urban_{filename}"
-            target_path = self.clean_dir / f'fold{fold}' / target_filename
 
-            # Process audio
-            if source_path.exists():
+            if not source_path.exists():
+                continue
+
+            # If the class is a noise class, process it as noise
+            if class_name in noise_classes:
+                target_filename = f"noise_{self.noise_counter:05d}.wav"
+                target_path = self.noise_dir / target_filename
                 success = self.process_audio_file(source_path, target_path)
-
                 if success:
-                    # Add to metadata
+                    self.metadata['noise_samples'].append({
+                        'filename': target_filename,
+                        'source_dataset': 'urbansound8k_as_noise',
+                        'original_filename': filename,
+                        'original_class': class_name
+                    })
+                    self.noise_counter += 1
+            # Otherwise, process as a clean feature
+            else:
+                target_filename = f"urban_{filename}"
+                target_path = self.clean_dir / f'fold{fold}' / target_filename
+                success = self.process_audio_file(source_path, target_path)
+                if success:
                     self.metadata['clean_samples'].append({
                         'filename': target_filename,
                         'fold': fold,
@@ -142,23 +160,28 @@ class AudioDatasetOrganizer:
                         'original_filename': filename
                     })
 
-    def organize_speech_dataset(self, speech_path, fold_assignment='balanced', exclude_noisy=True):
+    def organize_speech_dataset(self, speech_paths, fold_assignment='balanced', exclude_noisy=True):
         """
         Process Speech Activity Detection dataset and assign to folds.
 
         Args:
-            speech_path: Path to speech dataset root
+            speech_paths: List of paths to speech dataset roots
             fold_assignment: How to assign folds ('balanced', 'sequential', or 'random')
             exclude_noisy: If True, exclude pre-noisy samples from Noizeus folder
         """
         print("Processing Speech Activity Detection dataset...")
-        speech_path = Path(speech_path)
-
-        # Find all audio files in the speech dataset
-        audio_extensions = ['.wav', '.flac', '.mp3']
         audio_files = []
-        for ext in audio_extensions:
-            audio_files.extend(list(speech_path.rglob(f'*{ext}')))
+        audio_extensions = ['.wav', '.flac', '.mp3']
+
+        for speech_path in speech_paths:
+            speech_path = Path(speech_path)
+            if not speech_path.exists():
+                print(f"Warning: Speech path does not exist: {speech_path}")
+                continue
+            
+            print(f"  Scanning for speech files in: {speech_path}")
+            for ext in audio_extensions:
+                audio_files.extend(list(speech_path.rglob(f'*{ext}')))
 
         # Filter out Noizeus pre-noisy samples if requested
         if exclude_noisy:
@@ -167,8 +190,8 @@ class AudioDatasetOrganizer:
             filtered_count = original_count - len(audio_files)
             if filtered_count > 0:
                 print(f"  Excluded {filtered_count} pre-noisy samples from Noizeus corpus")
-                print(f"  Using {len(audio_files)} clean speech samples")
-
+        
+        print(f"  Found {len(audio_files)} clean speech samples in total")
         # Assign a new class ID for speech (continuing from UrbanSound8K classes)
         max_class_id = max(self.metadata['class_mapping'].keys()) if self.metadata['class_mapping'] else -1
         speech_class_id = max_class_id + 1
@@ -214,7 +237,6 @@ class AudioDatasetOrganizer:
         """
         print("Processing noise datasets...")
 
-        noise_counter = 0
         audio_extensions = ['.wav', '.flac', '.mp3', '.ogg', '.webm']
 
         for noise_path in noise_paths:
@@ -232,7 +254,7 @@ class AudioDatasetOrganizer:
 
             # Process each noise file
             for audio_file in tqdm(audio_files, desc=f"Noise - {noise_path.name}"):
-                target_filename = f"noise_{noise_counter:05d}.wav"
+                target_filename = f"noise_{self.noise_counter:05d}.wav"
                 target_path = self.noise_dir / target_filename
 
                 # Process audio
@@ -245,9 +267,9 @@ class AudioDatasetOrganizer:
                         'source_dataset': noise_path.name,
                         'original_filename': audio_file.name
                     })
-                    noise_counter += 1
+                    self.noise_counter += 1
 
-        print(f"Total noise samples processed: {noise_counter}")
+        print(f"Total noise samples processed: {self.noise_counter}")
 
     def save_metadata(self):
         """Save consolidated metadata to JSON and CSV files."""
@@ -379,12 +401,17 @@ def main():
         output_base_dir='organized_dataset'
     )
 
-    # Dataset paths - CORRECTED to match actual folder structure
-    URBANSOUND8K_PATH = 'datasets/urbansound8k'
-    SPEECH_DATASET_PATH = 'datasets/speech-activity-detection-datasets/Audio'  # Point to Audio subfolder
+    # Dataset paths - CORRECTED to match actual folder structure and separate speech/noise
+    URBANSOUND8K_PATH = 'raw_datasets/urbansound8k'
+    SPEECH_DATASET_PATHS = [
+        'raw_datasets/speech-activity-detection-datasets/Audio',  # Main speech corpus
+        'raw_datasets/noise-data-set/clean_train',              # Contains clean speech
+        'raw_datasets/noise-data-set/clean_test'                # Contains clean speech
+    ]
     NOISE_DATASET_PATHS = [
-        'datasets/audio-noise-dataset',      # Contains .webm files
-        'datasets/noise-data-set'            # Contains clean_train, noise_train folders
+        'raw_datasets/audio-noise-dataset',      # Contains .webm files, assumed to be noise
+        'raw_datasets/noise-data-set/noise_train',            # Specific noise folder
+        'raw_datasets/noise-data-set/noise_test'              # Specific noise folder
     ]
 
     print("=" * 70)
@@ -396,7 +423,7 @@ def main():
     print(f"  Output directory: {organizer.output_base_dir}")
     print(f"\nDataset sources:")
     print(f"  1. UrbanSound8K: {URBANSOUND8K_PATH}")
-    print(f"  2. Speech Audio: {SPEECH_DATASET_PATH}")
+    print(f"  2. Speech Audio: {len(SPEECH_DATASET_PATHS)} sources")
     print(f"  3. Noise datasets: {len(NOISE_DATASET_PATHS)} sources")
     print("=" * 70)
 
@@ -404,8 +431,8 @@ def main():
     print("\n[STEP 1/5] Processing UrbanSound8K...")
     organizer.organize_urbansound8k(URBANSOUND8K_PATH)
 
-    print("\n[STEP 2/5] Processing Speech Dataset (excluding pre-noisy Noizeus samples)...")
-    organizer.organize_speech_dataset(SPEECH_DATASET_PATH, fold_assignment='balanced', exclude_noisy=True)
+    print("\n[STEP 2/5] Processing Speech Datasets (excluding pre-noisy Noizeus samples)...")
+    organizer.organize_speech_dataset(SPEECH_DATASET_PATHS, fold_assignment='balanced', exclude_noisy=True)
 
     print("\n[STEP 3/5] Processing Noise Datasets...")
     organizer.organize_noise_datasets(NOISE_DATASET_PATHS)

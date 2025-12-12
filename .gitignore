@@ -1,6 +1,5 @@
 # Audio data (too large for git)
-raw_datasets/
-organized_dataset/
+data/
 
 # Python
 __pycache__/

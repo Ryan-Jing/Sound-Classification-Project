@@ -8,6 +8,34 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 import pandas as pd
+from datetime import datetime
+import glob
+import os
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import re # Added import for regular expressions
+
+def plot_confusion_matrix(y_true, y_pred, class_names, save_path=None, title='Confusion Matrix'):
+    """
+    Plots the confusion matrix.
+    
+    Args:
+        y_true: True labels.
+        y_pred: Predicted labels.
+        class_names: List of class names (e.g., ['No-Speech', 'Speech']).
+        save_path: Optional path to save the figure.
+        title: Title of the plot.
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    disp.plot(cmap=plt.cm.Blues, ax=ax)
+    ax.set_title(title)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Confusion Matrix saved to {save_path}")
+    else:
+        plt.show()
 
 def plot_training_curves(results_path, save_path=None):
     """
@@ -195,26 +223,32 @@ def plot_curriculum_impact(results_path, save_path=None):
     snr_groups = {}
     for epoch_data in results['epochs']:
         snr = epoch_data['snr_db']
-        if snr == float('inf'):
+        if snr == float('inf') or snr is None:
             snr = 'Clean'
         else:
             snr = f'{snr} dB'
-        
+
         if snr not in snr_groups:
             snr_groups[snr] = {'train_acc': [], 'test_acc': []}
-        
+
         snr_groups[snr]['train_acc'].append(epoch_data['train_acc'])
         snr_groups[snr]['test_acc'].append(epoch_data['test_acc'])
-    
+
     # Calculate average performance at each noise level
     snr_labels = []
     avg_train_acc = []
     avg_test_acc = []
-    
+
     # Sort by SNR (Clean first, then descending)
-    sorted_snr = sorted(snr_groups.keys(), 
-                       key=lambda x: float('inf') if x == 'Clean' else float(x.split()[0]),
-                       reverse=True)
+    def snr_sort_key(x):
+        if x == 'Clean':
+            return float('inf')
+        try:
+            return float(x.split()[0])
+        except (ValueError, AttributeError, IndexError):
+            return -float('inf')  # Put invalid entries at the end
+
+    sorted_snr = sorted(snr_groups.keys(), key=snr_sort_key, reverse=True)
     
     for snr in sorted_snr:
         snr_labels.append(snr)
@@ -303,10 +337,15 @@ def generate_report(results_path):
             if snr not in snr_stages:
                 snr_stages[snr] = []
             snr_stages[snr].append(epoch['test_acc'])
-        
-        for snr in sorted(snr_stages.keys(), reverse=True):
+
+        # Sort SNR values, handling None and inf
+        sorted_snrs = sorted(snr_stages.keys(),
+                            key=lambda x: float('inf') if x is None or x == float('inf') else x,
+                            reverse=True)
+
+        for snr in sorted_snrs:
             avg_acc = np.mean(snr_stages[snr])
-            if snr == float('inf'):
+            if snr == float('inf') or snr is None:
                 print(f"  Clean Audio: {avg_acc:.2f}% average test accuracy")
             else:
                 print(f"  SNR {snr} dB: {avg_acc:.2f}% average test accuracy")
@@ -329,57 +368,121 @@ def generate_report(results_path):
     
     print("\n" + "=" * 70)
 
+def find_latest_results_dir(base_dir='results'): # Changed name and default base_dir
+    """
+    Find the directory containing the most recent results.
+
+    Args:
+        base_dir: Directory to search for result directories.
+
+    Returns:
+        Path to the latest results directory or None if not found.
+    """
+    all_run_dirs = [d for d in Path(base_dir).iterdir() if d.is_dir() and 'speechcnn' in d.name]
+    
+    if not all_run_dirs:
+        return None
+
+    # Sort by timestamp in directory name, most recent first
+    def get_timestamp_from_dir_name(dir_path):
+        match = re.search(r'(\d{8}_\d{6})', dir_path.name)
+        if match:
+            return match.group(1)
+        return "" # Return empty string if no timestamp found, will be sorted to beginning
+
+    all_run_dirs.sort(key=get_timestamp_from_dir_name, reverse=True)
+    return all_run_dirs[0]
+
 def main():
     """Main visualization execution."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Visualize training results')
-    parser.add_argument('--results', type=str, help='Path to results JSON file')
+    parser.add_argument('--results-dir', type=str, help='Path to results directory (auto-detects latest if not provided)')
     parser.add_argument('--comparison', type=str, help='Path to comparison JSON file')
-    parser.add_argument('--save-dir', type=str, default='plots', help='Directory to save plots')
+    parser.add_argument('--save-dir', type=str, default='results', help='Directory to save plots (default: results/)')
     parser.add_argument('--report', action='store_true', help='Generate text report')
-    
+
     args = parser.parse_args()
+
+    # Auto-detect latest results directory if not provided
+    run_dir = None
+    if args.results_dir:
+        run_dir = Path(args.results_dir)
+    else:
+        run_dir = find_latest_results_dir(base_dir=args.save_dir) # Use save_dir as base for finding
+        if run_dir:
+            print(f"Auto-detected latest results directory: {run_dir}")
+        else:
+            print("No results directories found. Please specify --results-dir")
+            return
+
+    # Check if results JSON exists in the run_dir
+    results_json_path = list(run_dir.glob('*_results_*.json'))
+    if not results_json_path:
+        print(f"No results JSON file found in {run_dir}")
+        return
+    results_json_path = results_json_path[0] # Take the first one found
+
+    # Load results JSON to get model_type etc.
+    with open(results_json_path, 'r') as f:
+        results = json.load(f)
+        model_type = results['model_type'].lower()
+        test_fold = results.get('test_fold', 'N/A') # Use N/A if not found
+
+    # Create subfolder (if not already existing from auto-detection)
+    # The run_dir already handles this, so we just use it directly.
     
-    # Create save directory
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(exist_ok=True)
-    
-    if args.results:
-        # Generate report
-        if args.report:
-            generate_report(args.results)
-        
-        # Plot training curves
-        model_name = Path(args.results).stem
-        plot_training_curves(
-            args.results,
-            save_path=save_dir / f'{model_name}_training_curves.png'
-        )
-        
-        # Plot curriculum impact (CNN/RNN only)
+    # Generate report
+    if args.report:
+        generate_report(results_json_path)
+
+    # Plot training curves
+    plot_training_curves(
+        results_json_path,
+        save_path=run_dir / f'{model_type}_training_curves.png'
+    )
+
+    # Plot curriculum impact (CNN/RNN only)
+    if model_type in ['speechcnn', 'cnn', 'rnn']: # Adjust for 'speechcnn'
         plot_curriculum_impact(
-            args.results,
-            save_path=save_dir / f'{model_name}_curriculum_impact.png'
+            results_json_path,
+            save_path=run_dir / f'{model_type}_curriculum_impact.png'
         )
-    
+
+    # Load and plot confusion matrix
+    try:
+        test_preds = np.load(run_dir / 'test_preds.npy')
+        test_labels = np.load(run_dir / 'test_labels.npy')
+        pure_noise_preds = np.load(run_dir / 'pure_noise_preds.npy')
+        pure_noise_labels = np.load(run_dir / 'pure_noise_labels.npy')
+
+        all_preds = np.concatenate((test_preds, pure_noise_preds))
+        all_labels = np.concatenate((test_labels, pure_noise_labels))
+        class_names = ['No-Speech', 'Speech']
+
+        plot_confusion_matrix(
+            all_labels, all_preds, class_names,
+            save_path=run_dir / f'{model_type}_confusion_matrix.png',
+            title=f'{model_type} Confusion Matrix (Combined Test Sets)'
+        )
+    except FileNotFoundError:
+        print(f"Prediction/Label .npy files not found in {run_dir}. Skipping confusion matrix plot.")
+    except Exception as e:
+        print(f"Error plotting confusion matrix: {e}")
+
+
+    print(f"\nPlots saved to {run_dir}/")
+
     if args.comparison:
+        # Create subfolder for comparisons
+        comparison_dir = run_dir.parent / f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}" # Use run_dir's parent
+        comparison_dir.mkdir(exist_ok=True)
+
         # Compare models
         compare_models(
-            args.comparison,
-            save_path=save_dir / 'model_comparison.png'
+            Path(args.comparison), # Ensure it's a Path object
+            save_path=comparison_dir / 'model_comparison.png'
         )
-    
-    print(f"\nPlots saved to {save_dir}/")
 
-if __name__ == "__main__":
-    # Example usage if run without arguments
-    import sys
-    if len(sys.argv) == 1:
-        print("Visualization Script for Audio Classification")
-        print("\nUsage examples:")
-        print("  python visualize_results.py --results cnn_results_fold1.json --report")
-        print("  python visualize_results.py --comparison model_comparison_fold1.json")
-        print("  python visualize_results.py --results rnn_results_fold1.json --save-dir my_plots")
-    else:
-        main()
+        print(f"\nComparison plots saved to {comparison_dir}/")

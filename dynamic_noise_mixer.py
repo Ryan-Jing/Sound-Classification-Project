@@ -176,7 +176,7 @@ class AudioDatasetWithDynamicNoise(Dataset):
     """
     
     def __init__(self, metadata_csv, clean_audio_dir, noise_mixer, 
-                 fold=1, mode='train', transform=None, 
+                 test_fold=1, validation_fold=2, mode='train', transform=None, 
                  noise_curriculum=None, current_epoch=0):
         """
         Initialize dataset.
@@ -185,11 +185,12 @@ class AudioDatasetWithDynamicNoise(Dataset):
             metadata_csv: Path to clean samples metadata CSV
             clean_audio_dir: Directory containing clean audio files
             noise_mixer: DynamicNoiseMixer instance
-            fold: Which fold to use (1-10)
-            mode: 'train' or 'test' (test uses different folds)
+            test_fold: Fold to use for testing
+            validation_fold: Fold to use for validation
+            mode: 'train', 'validation', or 'test'
             transform: Optional feature extraction transform
-            noise_curriculum: Dict defining noise progression (e.g., {'epochs': [0, 10, 20], 'snr_db': [inf, 20, 10]})
-            current_epoch: Current training epoch for curriculum learning
+            noise_curriculum: Dict defining noise progression
+            current_epoch: Current training epoch
         """
         self.clean_audio_dir = Path(clean_audio_dir)
         self.noise_mixer = noise_mixer
@@ -201,13 +202,17 @@ class AudioDatasetWithDynamicNoise(Dataset):
         # Load metadata
         df = pd.read_csv(metadata_csv)
         
-        # Filter by fold (train uses all except test fold, test uses only test fold)
+        # Filter by fold
         if mode == 'train':
-            self.samples = df[df['fold'] != fold].reset_index(drop=True)
+            # Train on all folds except test and validation
+            self.samples = df[(df['fold'] != test_fold) & (df['fold'] != validation_fold)].reset_index(drop=True)
+        elif mode == 'validation':
+            # Validate on a single, separate fold
+            self.samples = df[df['fold'] == validation_fold].reset_index(drop=True)
         else:  # test
-            self.samples = df[df['fold'] == fold].reset_index(drop=True)
+            self.samples = df[df['fold'] == test_fold].reset_index(drop=True)
         
-        print(f"Loaded {len(self.samples)} samples for {mode} (fold {fold})")
+        print(f"Loaded {len(self.samples)} samples for {mode} (test_fold={test_fold}, validation_fold={validation_fold})")
         
     def set_epoch(self, epoch):
         """Update current epoch for curriculum learning."""
@@ -318,20 +323,23 @@ class MFCCTransform:
 def create_dataloaders(organized_dataset_dir, test_fold=1, batch_size=32, 
                        noise_curriculum=None, num_workers=4):
     """
-    Create train and test dataloaders with dynamic noise mixing.
+    Create train, validation, and test dataloaders with dynamic noise mixing.
     
     Args:
         organized_dataset_dir: Path to organized dataset directory
         test_fold: Which fold to use for testing (1-10)
         batch_size: Batch size for dataloaders
-        noise_curriculum: Curriculum for progressive noise (e.g., {'epochs': [0, 10, 20, 30], 'snr_db': [inf, 20, 15, 10]})
+        noise_curriculum: Curriculum for progressive noise
         num_workers: Number of workers for data loading
         
     Returns:
-        tuple: (train_loader, test_loader, noise_mixer)
+        tuple: (train_loader, validation_loader, test_loader, train_dataset)
     """
     organized_dataset_dir = Path(organized_dataset_dir)
     
+    # Define validation fold (e.g., the one after test_fold, wrapping around)
+    validation_fold = (test_fold % 10) + 1
+
     # Initialize noise mixer
     noise_mixer = DynamicNoiseMixer(
         noise_dir=organized_dataset_dir / 'noise_audio',
@@ -346,22 +354,33 @@ def create_dataloaders(organized_dataset_dir, test_fold=1, batch_size=32,
         metadata_csv=organized_dataset_dir / 'metadata' / 'clean_samples.csv',
         clean_audio_dir=organized_dataset_dir / 'clean_audio',
         noise_mixer=noise_mixer,
-        fold=test_fold,
+        test_fold=test_fold,
+        validation_fold=validation_fold,
         mode='train',
         transform=mfcc_transform,
-        noise_curriculum=noise_curriculum,
-        current_epoch=0
+        noise_curriculum=noise_curriculum
+    )
+
+    validation_dataset = AudioDatasetWithDynamicNoise(
+        metadata_csv=organized_dataset_dir / 'metadata' / 'clean_samples.csv',
+        clean_audio_dir=organized_dataset_dir / 'clean_audio',
+        noise_mixer=noise_mixer,
+        test_fold=test_fold,
+        validation_fold=validation_fold,
+        mode='validation',
+        transform=mfcc_transform,
+        noise_curriculum=None  # No noise for validation
     )
     
     test_dataset = AudioDatasetWithDynamicNoise(
         metadata_csv=organized_dataset_dir / 'metadata' / 'clean_samples.csv',
         clean_audio_dir=organized_dataset_dir / 'clean_audio',
         noise_mixer=noise_mixer,
-        fold=test_fold,
+        test_fold=test_fold,
+        validation_fold=validation_fold,
         mode='test',
         transform=mfcc_transform,
-        noise_curriculum=None,  # Always use clean audio for testing
-        current_epoch=0
+        noise_curriculum=None  # Always use clean audio for testing
     )
     
     # Create dataloaders
@@ -369,6 +388,14 @@ def create_dataloaders(organized_dataset_dir, test_fold=1, batch_size=32,
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=batch_size,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True
     )
@@ -381,7 +408,7 @@ def create_dataloaders(organized_dataset_dir, test_fold=1, batch_size=32,
         pin_memory=True
     )
     
-    return train_loader, test_loader, train_dataset
+    return train_loader, validation_loader, test_loader, train_dataset
 
 
 # Example usage
@@ -394,7 +421,7 @@ if __name__ == "__main__":
     }
     
     # Create dataloaders
-    train_loader, test_loader, train_dataset = create_dataloaders(
+    train_loader, val_loader, test_loader, train_dataset = create_dataloaders(
         organized_dataset_dir='organized_dataset',
         test_fold=1,
         batch_size=32,
@@ -402,6 +429,10 @@ if __name__ == "__main__":
         num_workers=4
     )
     
+    print(f"Train loader: {len(train_loader.dataset)} samples")
+    print(f"Validation loader: {len(val_loader.dataset)} samples")
+    print(f"Test loader: {len(test_loader.dataset)} samples")
+
     # Example: Training loop with curriculum learning
     print("\nExample training loop structure:")
     print("=" * 50)

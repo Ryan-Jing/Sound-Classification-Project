@@ -1,0 +1,77 @@
+{
+  "model_type": "SpeechCNN",
+  "epochs": [
+    {
+      "epoch": 0,
+      "snr_db": null,
+      "train_loss": 0.1655178676446667,
+      "train_acc": 94.36052366565961,
+      "val_acc": 100.0
+    },
+    {
+      "epoch": 1,
+      "snr_db": null,
+      "train_loss": 0.06461732769821538,
+      "train_acc": 97.78449144008056,
+      "val_acc": 100.0
+    },
+    {
+      "epoch": 2,
+      "snr_db": null,
+      "train_loss": 0.04048625425912178,
+      "train_acc": 98.5901309164149,
+      "val_acc": 100.0
+    },
+    {
+      "epoch": 3,
+      "snr_db": null,
+      "train_loss": 0.027240713985520415,
+      "train_acc": 99.09365558912387,
+      "val_acc": 99.09909909909909
+    },
+    {
+      "epoch": 4,
+      "snr_db": null,
+      "train_loss": 0.027639368528070918,
+      "train_acc": 99.29506545820745,
+      "val_acc": 100.0
+    },
+    {
+      "epoch": 5,
+      "snr_db": 15,
+      "train_loss": 0.1481907473571482,
+      "train_acc": 97.18026183282981,
+      "val_acc": 99.09909909909909
+    },
+    {
+      "epoch": 6,
+      "snr_db": 15,
+      "train_loss": 0.043883709207875654,
+      "train_acc": 98.5901309164149,
+      "val_acc": 97.29729729729729
+    },
+    {
+      "epoch": 7,
+      "snr_db": 15,
+      "train_loss": 0.03605278657050803,
+      "train_acc": 98.89224572004028,
+      "val_acc": 99.09909909909909
+    },
+    {
+      "epoch": 8,
+      "snr_db": 15,
+      "train_loss": 0.04562239208462415,
+      "train_acc": 98.89224572004028,
+      "val_acc": 99.09909909909909
+    },
+    {
+      "epoch": 9,
+      "snr_db": 15,
+      "train_loss": 0.027032681235141354,
+      "train_acc": 99.19436052366567,
+      "val_acc": 99.09909909909909
+    }
+  ],
+  "final_test_accuracy": 95.66787003610108,
+  "final_pure_noise_accuracy": 0.4878048780487805
+}

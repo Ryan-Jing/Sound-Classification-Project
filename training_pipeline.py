@@ -36,6 +36,8 @@ class AudioCNN(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
         
         self.pool = nn.MaxPool2d(2, 2)
         self.dropout = nn.Dropout(0.3)
@@ -54,6 +56,7 @@ class AudioCNN(nn.Module):
         x = self.pool(torch.relu(self.bn1(self.conv1(x))))
         x = self.pool(torch.relu(self.bn2(self.conv2(x))))
         x = self.pool(torch.relu(self.bn3(self.conv3(x))))
+        x = self.pool(torch.relu(self.bn4(self.conv4(x))))
         
         # Flatten
         x = x.view(x.size(0), -1)
@@ -73,8 +76,8 @@ class AudioCNN(nn.Module):
 class AudioRNN(nn.Module):
     """RNN/LSTM model for audio classification from MFCC features."""
     
-    def __init__(self, num_classes=10, n_mfcc=40, hidden_size=128, 
-                 num_layers=2, rnn_type='LSTM', bidirectional=True):
+    def __init__(self, num_classes=10, n_mfcc=40, hidden_size=256, 
+                 num_layers=3, rnn_type='LSTM', bidirectional=True):
         super(AudioRNN, self).__init__()
         
         self.n_mfcc = n_mfcc
@@ -172,8 +175,8 @@ class CNNTrainer:
         
         return total_loss / len(train_loader), 100. * correct / total
     
-    def evaluate(self, test_loader):
-        """Evaluate model on test set."""
+    def evaluate(self, dataloader):
+        """Evaluate model on a dataloader."""
         self.model.eval()
         correct = 0
         total = 0
@@ -181,7 +184,7 @@ class CNNTrainer:
         all_labels = []
         
         with torch.no_grad():
-            for features, labels in test_loader:
+            for features, labels in dataloader:
                 features, labels = features.to(self.device), labels.to(self.device)
                 outputs = self.model(features)
                 _, predicted = outputs.max(1)
@@ -238,19 +241,19 @@ class SVMTrainer:
         
         return train_acc
     
-    def evaluate(self, test_loader):
+    def evaluate(self, dataloader):
         """Evaluate SVM model."""
-        print("Extracting test features...")
-        X_test, y_test = self.extract_features(test_loader)
+        print("Extracting features for evaluation...")
+        X_eval, y_eval = self.extract_features(dataloader)
         
         print("Scaling features...")
-        X_test = self.scaler.transform(X_test)
+        X_eval = self.scaler.transform(X_eval)
         
         print("Evaluating...")
-        predictions = self.model.predict(X_test)
-        accuracy = accuracy_score(y_test, predictions) * 100
+        predictions = self.model.predict(X_eval)
+        accuracy = accuracy_score(y_eval, predictions) * 100
         
-        return accuracy, predictions, y_test
+        return accuracy, predictions, y_eval
 
 
 # ============================================================================
@@ -258,8 +261,8 @@ class SVMTrainer:
 # ============================================================================
 
 def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dataset',
-                         test_fold=1, num_epochs=30, batch_size=32, 
-                         learning_rate=0.001, device='cuda'):
+                         test_fold=1, num_epochs=50, batch_size=32, 
+                         learning_rate=0.001, device='auto'):
     """
     Complete training pipeline with progressive noise curriculum.
     
@@ -270,11 +273,21 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
         num_epochs: Number of training epochs
         batch_size: Batch size
         learning_rate: Learning rate (for CNN/RNN)
-        device: 'cuda' or 'cpu'
+        device: 'auto', 'cuda', 'mps', or 'cpu'
     """
     
     # Setup device
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    if device == 'auto':
+        if torch.cuda.is_available():
+            selected_device = 'cuda'
+        elif torch.backends.mps.is_available():
+            selected_device = 'mps'
+        else:
+            selected_device = 'cpu'
+    else:
+        selected_device = device
+        
+    device = torch.device(selected_device)
     print(f"Using device: {device}")
     
     # Load class mapping to get number of classes
@@ -293,7 +306,7 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
     
     # Create dataloaders
     print("\nCreating dataloaders...")
-    train_loader, test_loader, train_dataset = create_dataloaders(
+    train_loader, validation_loader, test_loader, train_dataset = create_dataloaders(
         organized_dataset_dir=organized_dataset_dir,
         test_fold=test_fold,
         batch_size=batch_size,
@@ -312,13 +325,13 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
     elif model_type == 'RNN':
         print("\nInitializing RNN/LSTM model...")
         model = AudioRNN(num_classes=num_classes, n_mfcc=40, 
-                        hidden_size=128, num_layers=2, rnn_type='LSTM')
+                        hidden_size=256, num_layers=3, rnn_type='LSTM')
         trainer = CNNTrainer(model, device, num_classes)  # Same training logic
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
         
     elif model_type == 'SVM':
-        print("\nInitializing SVM model...")
+        print("\nInitializing SVM model (runs on CPU)...")
         trainer = SVMTrainer(C=1.0, kernel='rbf', gamma='scale')
         # Note: SVM will be retrained each curriculum stage
         
@@ -338,10 +351,12 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
     print("=" * 70)
     
     if model_type in ['CNN', 'RNN']:
-        # PyTorch model training with epochs
-        best_test_acc = 0
+        import time
+        total_train_time = 0
+        best_val_acc = 0
         
         for epoch in range(num_epochs):
+            epoch_start_time = time.time()
             # Update curriculum
             train_dataset.set_epoch(epoch)
             snr = train_dataset.get_noise_level()
@@ -359,11 +374,16 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
             # Train
             train_loss, train_acc = trainer.train_epoch(train_loader, optimizer, epoch)
             
-            # Evaluate
-            test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
+            # Evaluate on validation set
+            val_acc, _, _ = trainer.evaluate(validation_loader)
+            
+            epoch_end_time = time.time()
+            epoch_duration = epoch_end_time - epoch_start_time
+            total_train_time += epoch_duration
             
             print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"  Test Acc: {test_acc:.2f}%")
+            print(f"  Validation Acc: {val_acc:.2f}%")
+            print(f"  Epoch Time: {epoch_duration:.2f}s")
             
             # Save results
             results['epochs'].append({
@@ -371,17 +391,27 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
                 'snr_db': snr,
                 'train_loss': train_loss,
                 'train_acc': train_acc,
-                'test_acc': test_acc
+                'val_acc': val_acc,
+                'epoch_duration_s': epoch_duration
             })
             
-            # Save best model
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
+            # Save best model based on validation accuracy
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
                 torch.save(model.state_dict(), f'best_{model_type.lower()}_fold{test_fold}.pth')
-                print(f"  New best model saved! (Test Acc: {best_test_acc:.2f}%)")
+                print(f"  New best model saved! (Validation Acc: {best_val_acc:.2f}%)")
             
             # Step scheduler
             scheduler.step()
+            
+        print(f"\nTotal Training Time: {total_train_time:.2f}s")
+        
+        # Final evaluation on test set with the best model
+        print("\nLoading best model for final evaluation on test set...")
+        model.load_state_dict(torch.load(f'best_{model_type.lower()}_fold{test_fold}.pth'))
+        test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
+        print(f"  Final Test Accuracy: {test_acc:.2f}%")
+        results['final_test_accuracy'] = test_acc
     
     else:  # SVM
         # Train SVM at each curriculum stage
@@ -398,23 +428,29 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
             # Train SVM
             train_acc = trainer.train(train_loader)
             
-            # Evaluate
-            test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
+            # Evaluate on validation set
+            val_acc, _, _ = trainer.evaluate(validation_loader)
             
             print(f"  Train Acc: {train_acc:.2f}%")
-            print(f"  Test Acc: {test_acc:.2f}%")
+            print(f"  Validation Acc: {val_acc:.2f}%")
             
             # Save results
             results['curriculum_stages'].append({
                 'stage': stage_idx,
                 'snr_db': snr,
                 'train_acc': train_acc,
-                'test_acc': test_acc
+                'val_acc': val_acc
             })
             
             # Save model at this stage
             with open(f'svm_fold{test_fold}_stage{stage_idx}.pkl', 'wb') as f:
                 pickle.dump({'model': trainer.model, 'scaler': trainer.scaler}, f)
+
+        # Final evaluation on test set
+        print("\nEvaluating final SVM model on test set...")
+        test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
+        print(f"  Final Test Accuracy: {test_acc:.2f}%")
+        results['final_test_accuracy'] = test_acc
     
     # Save final results
     results_path = f'{model_type.lower()}_results_fold{test_fold}.json'
@@ -429,7 +465,7 @@ def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dat
     return results
 
 
-def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1):
+def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1, device='auto'):
     """Train and compare CNN, SVM, and RNN models."""
     
     results = {}
@@ -442,9 +478,10 @@ def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1):
         model_type='CNN',
         organized_dataset_dir=organized_dataset_dir,
         test_fold=test_fold,
-        num_epochs=30,
+        num_epochs=50,
         batch_size=32,
-        learning_rate=0.001
+        learning_rate=0.001,
+        device=device
     )
     
     # Train RNN
@@ -455,9 +492,10 @@ def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1):
         model_type='RNN',
         organized_dataset_dir=organized_dataset_dir,
         test_fold=test_fold,
-        num_epochs=30,
+        num_epochs=50,
         batch_size=32,
-        learning_rate=0.001
+        learning_rate=0.001,
+        device=device
     )
     
     # Train SVM
@@ -469,6 +507,7 @@ def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1):
         organized_dataset_dir=organized_dataset_dir,
         test_fold=test_fold,
         batch_size=32
+        # device is not passed to SVM, as it runs on CPU
     )
     
     # Save comparison
