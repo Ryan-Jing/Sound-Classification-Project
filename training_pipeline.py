@@ -1,537 +1,96 @@
-"""
-Complete Training Pipeline for Audio Classification
-Supports CNN, SVM, and RNN/LSTM models with dynamic noise curriculum learning.
-"""
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report
-import json
+import os
+import datetime
+import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
-import pickle
 
-from dynamic_noise_mixer import create_dataloaders, AudioDatasetWithDynamicNoise, MFCCTransform
+# Custom module imports
+from data_loader import get_user_choices, prepare_dataloaders
+from models.cnn import CNNModel
+from models.rnn import RNNModel
+from trainers.pytorch_trainer import train_pytorch_model
+from trainers.svm_trainer import train_svm_model
+from utils.visualizer import plot_training_history, plot_confusion_matrix
 
-
-# ============================================================================
-# Model Definitions
-# ============================================================================
-
-class AudioCNN(nn.Module):
-    """CNN model for audio classification from MFCC features."""
-    
-    def __init__(self, num_classes=10, n_mfcc=40):
-        super(AudioCNN, self).__init__()
-        
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
-        
-        self.pool = nn.MaxPool2d(2, 2)
-        self.dropout = nn.Dropout(0.3)
-        
-        # Will be set dynamically based on input size
-        self.fc1 = None
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, num_classes)
-        
-    def forward(self, x):
-        # x shape: [batch, n_mfcc, time_frames]
-        # Add channel dimension
-        x = x.unsqueeze(1)  # [batch, 1, n_mfcc, time_frames]
-        
-        # Convolutional blocks
-        x = self.pool(torch.relu(self.bn1(self.conv1(x))))
-        x = self.pool(torch.relu(self.bn2(self.conv2(x))))
-        x = self.pool(torch.relu(self.bn3(self.conv3(x))))
-        x = self.pool(torch.relu(self.bn4(self.conv4(x))))
-        
-        # Flatten
-        x = x.view(x.size(0), -1)
-        
-        # Initialize fc1 if needed
-        if self.fc1 is None:
-            self.fc1 = nn.Linear(x.size(1), 256).to(x.device)
-        
-        # Fully connected layers
-        x = self.dropout(torch.relu(self.fc1(x)))
-        x = self.dropout(torch.relu(self.fc2(x)))
-        x = self.fc3(x)
-        
-        return x
-
-
-class AudioRNN(nn.Module):
-    """RNN/LSTM model for audio classification from MFCC features."""
-    
-    def __init__(self, num_classes=10, n_mfcc=40, hidden_size=256, 
-                 num_layers=3, rnn_type='LSTM', bidirectional=True):
-        super(AudioRNN, self).__init__()
-        
-        self.n_mfcc = n_mfcc
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.bidirectional = bidirectional
-        
-        # RNN layer (LSTM or basic RNN)
-        if rnn_type == 'LSTM':
-            self.rnn = nn.LSTM(
-                input_size=n_mfcc,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                bidirectional=bidirectional,
-                dropout=0.3 if num_layers > 1 else 0
-            )
-        else:
-            self.rnn = nn.RNN(
-                input_size=n_mfcc,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-                bidirectional=bidirectional,
-                dropout=0.3 if num_layers > 1 else 0
-            )
-        
-        # Output layer
-        fc_input_size = hidden_size * 2 if bidirectional else hidden_size
-        self.fc = nn.Linear(fc_input_size, num_classes)
-        self.dropout = nn.Dropout(0.3)
-        
-    def forward(self, x):
-        # x shape: [batch, n_mfcc, time_frames]
-        # Transpose for RNN: [batch, time_frames, n_mfcc]
-        x = x.transpose(1, 2)
-        
-        # RNN forward pass
-        # output shape: [batch, time_frames, hidden_size * num_directions]
-        output, _ = self.rnn(x)
-        
-        # Use the last time step output
-        output = output[:, -1, :]
-        
-        # Fully connected layer
-        output = self.dropout(output)
-        output = self.fc(output)
-        
-        return output
-
-
-# ============================================================================
-# Training Functions
-# ============================================================================
-
-class CNNTrainer:
-    """Trainer for CNN model with curriculum learning."""
-    
-    def __init__(self, model, device, num_classes=10):
-        self.model = model.to(device)
-        self.device = device
-        self.num_classes = num_classes
-        self.criterion = nn.CrossEntropyLoss()
-        
-    def train_epoch(self, train_loader, optimizer, epoch):
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
-        
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
-        for features, labels in pbar:
-            features, labels = features.to(self.device), labels.to(self.device)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            outputs = self.model(features)
-            loss = self.criterion(outputs, labels)
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # Statistics
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            
-            pbar.set_postfix({
-                'loss': total_loss / (pbar.n + 1),
-                'acc': 100. * correct / total
-            })
-        
-        return total_loss / len(train_loader), 100. * correct / total
-    
-    def evaluate(self, dataloader):
-        """Evaluate model on a dataloader."""
-        self.model.eval()
-        correct = 0
-        total = 0
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for features, labels in dataloader:
-                features, labels = features.to(self.device), labels.to(self.device)
-                outputs = self.model(features)
-                _, predicted = outputs.max(1)
-                
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-                
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        accuracy = 100. * correct / total
-        return accuracy, all_preds, all_labels
-
-
-class SVMTrainer:
-    """Trainer for SVM model with curriculum learning."""
-    
-    def __init__(self, C=1.0, kernel='rbf', gamma='scale'):
-        self.model = SVC(C=C, kernel=kernel, gamma=gamma, verbose=False)
-        self.scaler = StandardScaler()
-        
-    def extract_features(self, dataloader):
-        """Extract flattened MFCC features and labels."""
-        features_list = []
-        labels_list = []
-        
-        for features, labels in tqdm(dataloader, desc='Extracting features'):
-            # Flatten MFCC features: [batch, n_mfcc, time] -> [batch, n_mfcc * time]
-            batch_size = features.size(0)
-            features_flat = features.view(batch_size, -1).numpy()
-            
-            features_list.append(features_flat)
-            labels_list.append(labels.numpy())
-        
-        X = np.vstack(features_list)
-        y = np.concatenate(labels_list)
-        
-        return X, y
-    
-    def train(self, train_loader):
-        """Train SVM model."""
-        print("Extracting training features...")
-        X_train, y_train = self.extract_features(train_loader)
-        
-        print("Scaling features...")
-        X_train = self.scaler.fit_transform(X_train)
-        
-        print(f"Training SVM on {X_train.shape[0]} samples...")
-        self.model.fit(X_train, y_train)
-        
-        # Training accuracy
-        train_preds = self.model.predict(X_train)
-        train_acc = accuracy_score(y_train, train_preds) * 100
-        
-        return train_acc
-    
-    def evaluate(self, dataloader):
-        """Evaluate SVM model."""
-        print("Extracting features for evaluation...")
-        X_eval, y_eval = self.extract_features(dataloader)
-        
-        print("Scaling features...")
-        X_eval = self.scaler.transform(X_eval)
-        
-        print("Evaluating...")
-        predictions = self.model.predict(X_eval)
-        accuracy = accuracy_score(y_eval, predictions) * 100
-        
-        return accuracy, predictions, y_eval
-
-
-# ============================================================================
-# Main Training Pipeline
-# ============================================================================
-
-def train_with_curriculum(model_type='CNN', organized_dataset_dir='organized_dataset',
-                         test_fold=1, num_epochs=50, batch_size=32, 
-                         learning_rate=0.001, device='auto'):
+def main():
     """
-    Complete training pipeline with progressive noise curriculum.
-    
-    Args:
-        model_type: 'CNN', 'SVM', or 'RNN'
-        organized_dataset_dir: Path to organized dataset
-        test_fold: Which fold to use for testing
-        num_epochs: Number of training epochs
-        batch_size: Batch size
-        learning_rate: Learning rate (for CNN/RNN)
-        device: 'auto', 'cuda', 'mps', or 'cpu'
+    Main function to run the interactive training pipeline.
     """
-    
-    # Setup device
-    if device == 'auto':
-        if torch.cuda.is_available():
-            selected_device = 'cuda'
-        elif torch.backends.mps.is_available():
-            selected_device = 'mps'
-        else:
-            selected_device = 'cpu'
-    else:
-        selected_device = device
-        
-    device = torch.device(selected_device)
-    print(f"Using device: {device}")
-    
-    # Load class mapping to get number of classes
-    import pandas as pd
-    class_mapping_path = Path(organized_dataset_dir) / 'metadata' / 'class_mapping.csv'
-    class_df = pd.read_csv(class_mapping_path)
-    num_classes = len(class_df)
-    print(f"Number of classes: {num_classes}")
-    
-    # Define noise curriculum
-    # Progressive noise: clean -> SNR 25dB -> 20dB -> 15dB -> 12dB -> 10dB
-    noise_curriculum = {
-        'epochs': [0, 5, 10, 15, 20, 25],
-        'snr_db': [float('inf'), 25, 20, 15, 12, 10]
-    }
-    
-    # Create dataloaders
-    print("\nCreating dataloaders...")
-    train_loader, validation_loader, test_loader, train_dataset = create_dataloaders(
-        organized_dataset_dir=organized_dataset_dir,
-        test_fold=test_fold,
-        batch_size=batch_size,
-        noise_curriculum=noise_curriculum,
-        num_workers=4
+    # --- 1. Get User Input ---
+    base_data_dir = Path('data/organized_audio_datasets')
+    features, model_type = get_user_choices(base_data_dir)
+
+    print(f"\nStarting training process for features: {', '.join(features)}")
+    print(f"Using model type: {model_type}")
+
+    # --- 2. Setup Output Directory ---
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    feature_str = features[0] if len(features) == 1 else 'all'
+    model_name = f"{model_type}_{feature_str}_{timestamp}"
+
+    output_dir = Path('results') / model_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Results will be saved in: {output_dir}")
+
+    # --- 3. Load Data ---
+    print("\nLoading and preparing data...")
+    dataloaders, class_to_idx = prepare_dataloaders(
+        base_data_dir, features, model_type
     )
-    
-    # Initialize model and trainer based on type
-    if model_type == 'CNN':
-        print("\nInitializing CNN model...")
-        model = AudioCNN(num_classes=num_classes, n_mfcc=40)
-        trainer = CNNTrainer(model, device, num_classes)
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-        
-    elif model_type == 'RNN':
-        print("\nInitializing RNN/LSTM model...")
-        model = AudioRNN(num_classes=num_classes, n_mfcc=40, 
-                        hidden_size=256, num_layers=3, rnn_type='LSTM')
-        trainer = CNNTrainer(model, device, num_classes)  # Same training logic
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-        
-    elif model_type == 'SVM':
-        print("\nInitializing SVM model (runs on CPU)...")
-        trainer = SVMTrainer(C=1.0, kernel='rbf', gamma='scale')
-        # Note: SVM will be retrained each curriculum stage
-        
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
-    # Training loop with curriculum
-    results = {
-        'model_type': model_type,
-        'test_fold': test_fold,
-        'epochs': [],
-        'curriculum_stages': []
-    }
-    
-    print("\n" + "=" * 70)
-    print(f"Starting {model_type} training with noise curriculum")
-    print("=" * 70)
-    
+
+    class_names = list(class_to_idx.keys())
+    num_classes = len(class_names)
+
+    # Save the class mapping
+    class_map_df = pd.DataFrame(class_to_idx.items(), columns=['class_name', 'class_id'])
+    class_map_df.to_csv(output_dir / 'class_mapping.csv', index=False)
+    print(f"Class mapping saved to {output_dir / 'class_mapping.csv'}")
+
+    # --- 4. Initialize and Train Model ---
     if model_type in ['CNN', 'RNN']:
-        import time
-        total_train_time = 0
-        best_val_acc = 0
-        
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
-            # Update curriculum
-            train_dataset.set_epoch(epoch)
-            snr = train_dataset.get_noise_level()
-            
-            if snr is None:
-                print(f"\nEpoch {epoch+1}/{num_epochs} - Training with CLEAN audio")
-            else:
-                print(f"\nEpoch {epoch+1}/{num_epochs} - Training with SNR = {snr} dB")
-                # Reduce learning rate when noise increases
-                if epoch in noise_curriculum['epochs'][1:]:
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] *= 0.8
-                        print(f"  Reduced learning rate to {param_group['lr']:.6f}")
-            
-            # Train
-            train_loss, train_acc = trainer.train_epoch(train_loader, optimizer, epoch)
-            
-            # Evaluate on validation set
-            val_acc, _, _ = trainer.evaluate(validation_loader)
-            
-            epoch_end_time = time.time()
-            epoch_duration = epoch_end_time - epoch_start_time
-            total_train_time += epoch_duration
-            
-            print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"  Validation Acc: {val_acc:.2f}%")
-            print(f"  Epoch Time: {epoch_duration:.2f}s")
-            
-            # Save results
-            results['epochs'].append({
-                'epoch': epoch,
-                'snr_db': snr,
-                'train_loss': train_loss,
-                'train_acc': train_acc,
-                'val_acc': val_acc,
-                'epoch_duration_s': epoch_duration
-            })
-            
-            # Save best model based on validation accuracy
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), f'best_{model_type.lower()}_fold{test_fold}.pth')
-                print(f"  New best model saved! (Validation Acc: {best_val_acc:.2f}%)")
-            
-            # Step scheduler
-            scheduler.step()
-            
-        print(f"\nTotal Training Time: {total_train_time:.2f}s")
-        
-        # Final evaluation on test set with the best model
-        print("\nLoading best model for final evaluation on test set...")
-        model.load_state_dict(torch.load(f'best_{model_type.lower()}_fold{test_fold}.pth'))
-        test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
-        print(f"  Final Test Accuracy: {test_acc:.2f}%")
-        results['final_test_accuracy'] = test_acc
-    
-    else:  # SVM
-        # Train SVM at each curriculum stage
-        for stage_idx, (epoch_start, snr) in enumerate(zip(
-            noise_curriculum['epochs'], noise_curriculum['snr_db']
-        )):
-            train_dataset.set_epoch(epoch_start)
-            
-            if snr == float('inf'):
-                print(f"\nStage {stage_idx+1} - Training with CLEAN audio")
-            else:
-                print(f"\nStage {stage_idx+1} - Training with SNR = {snr} dB")
-            
-            # Train SVM
-            train_acc = trainer.train(train_loader)
-            
-            # Evaluate on validation set
-            val_acc, _, _ = trainer.evaluate(validation_loader)
-            
-            print(f"  Train Acc: {train_acc:.2f}%")
-            print(f"  Validation Acc: {val_acc:.2f}%")
-            
-            # Save results
-            results['curriculum_stages'].append({
-                'stage': stage_idx,
-                'snr_db': snr,
-                'train_acc': train_acc,
-                'val_acc': val_acc
-            })
-            
-            # Save model at this stage
-            with open(f'svm_fold{test_fold}_stage{stage_idx}.pkl', 'wb') as f:
-                pickle.dump({'model': trainer.model, 'scaler': trainer.scaler}, f)
+        # Define learning rates for curriculum
+        learning_rates = {'clean': 1e-3, '20dB': 5e-4, '15dB': 2e-4, '10dB': 1e-4, '5dB': 5e-5}
 
-        # Final evaluation on test set
-        print("\nEvaluating final SVM model on test set...")
-        test_acc, test_preds, test_labels = trainer.evaluate(test_loader)
-        print(f"  Final Test Accuracy: {test_acc:.2f}%")
-        results['final_test_accuracy'] = test_acc
-    
-    # Save final results
-    results_path = f'{model_type.lower()}_results_fold{test_fold}.json'
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print("\n" + "=" * 70)
-    print("Training complete!")
-    print(f"Results saved to {results_path}")
-    print("=" * 70)
-    
-    return results
+        # Initialize model
+        if model_type == 'CNN':
+            model = CNNModel(num_classes=num_classes)
+        else: # RNN
+            model = RNNModel(input_size=128, num_classes=num_classes)
 
+        print(f"\nTraining {model_type} model with curriculum learning...")
 
-def compare_all_models(organized_dataset_dir='organized_dataset', test_fold=1, device='auto'):
-    """Train and compare CNN, SVM, and RNN models."""
-    
-    results = {}
-    
-    # Train CNN
-    print("\n" + "=" * 70)
-    print("TRAINING CNN MODEL")
-    print("=" * 70)
-    results['CNN'] = train_with_curriculum(
-        model_type='CNN',
-        organized_dataset_dir=organized_dataset_dir,
-        test_fold=test_fold,
-        num_epochs=50,
-        batch_size=32,
-        learning_rate=0.001,
-        device=device
-    )
-    
-    # Train RNN
-    print("\n" + "=" * 70)
-    print("TRAINING RNN/LSTM MODEL")
-    print("=" * 70)
-    results['RNN'] = train_with_curriculum(
-        model_type='RNN',
-        organized_dataset_dir=organized_dataset_dir,
-        test_fold=test_fold,
-        num_epochs=50,
-        batch_size=32,
-        learning_rate=0.001,
-        device=device
-    )
-    
-    # Train SVM
-    print("\n" + "=" * 70)
-    print("TRAINING SVM MODEL")
-    print("=" * 70)
-    results['SVM'] = train_with_curriculum(
-        model_type='SVM',
-        organized_dataset_dir=organized_dataset_dir,
-        test_fold=test_fold,
-        batch_size=32
-        # device is not passed to SVM, as it runs on CPU
-    )
-    
-    # Save comparison
-    with open(f'model_comparison_fold{test_fold}.json', 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print("\n" + "=" * 70)
-    print("ALL MODELS TRAINED - COMPARISON COMPLETE")
-    print("=" * 70)
-    
-    return results
+        history, test_labels, test_preds = train_pytorch_model(
+            model=model,
+            dataloaders=dataloaders,
+            learning_rates=learning_rates,
+            output_dir=output_dir,
+            num_epochs_per_level=5, # Train for 5 epochs on each noise level
+            model_name=model_name,
+            class_names=class_names
+        )
 
+        # --- 5. Visualize and Save Results ---
+        print("\nVisualizing and saving results...")
 
-if __name__ == "__main__":
-    # Example: Train a single model
-    # results = train_with_curriculum(
-    #     model_type='CNN',  # or 'RNN' or 'SVM'
-    #     organized_dataset_dir='organized_dataset',
-    #     test_fold=1,
-    #     num_epochs=30
-    # )
-    
-    # Example: Compare all models
-    results = compare_all_models(
-        organized_dataset_dir='organized_dataset',
-        test_fold=1
-    )
+        # Plot training history
+        plot_training_history(history, output_dir / f"{model_type}_training_curves.png")
+
+        # Plot confusion matrix
+        plot_confusion_matrix(test_labels, test_preds, class_names, output_dir / f"{model_type}_confusion_matrix.png")
+
+    elif model_type == 'SVM':
+        print(f"\nTraining {model_type} model...")
+
+        test_labels, test_preds = train_svm_model(
+            dataloaders=dataloaders,
+            class_names=class_names
+        )
+
+        # --- 5. Visualize and Save Results for SVM ---
+        print("\nVisualizing and saving results...")
+        plot_confusion_matrix(test_labels, test_preds, class_names, output_dir / f"{model_type}_confusion_matrix.png")
+
+    print(f"\n✅ Training and evaluation complete. Results saved in {output_dir}")
+
+if __name__ == '__main__':
+    main()
