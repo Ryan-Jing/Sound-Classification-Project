@@ -1,4 +1,0 @@
-[] Add multiple runs
-[] Add error bars
-[] Add spectrogram plots example
-[] Clean in-line comments, add larger function comments
