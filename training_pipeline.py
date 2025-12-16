@@ -68,7 +68,9 @@ def main():
                 model = RNNModel(input_size=128, num_classes=num_classes)
 
             print(f"Training {model_type} model...")
-            learning_rates = {'clean': 1e-3, '20dB': 5e-4, '15dB': 2e-4, '10dB': 1e-4, '5dB': 5e-5}
+            # learning_rates = {'clean': 1e-3, '20dB': 5e-4, '15dB': 2e-4, '10dB': 1e-4, '5dB': 5e-5}
+
+            learning_rates = {'clean': 1e-2, '20dB': 5e-3, '15dB': 2e-3, '10dB': 1e-3, '5dB': 5e-4}
 
             trial_model_name = f"{model_name}_trial_{i+1}"
 

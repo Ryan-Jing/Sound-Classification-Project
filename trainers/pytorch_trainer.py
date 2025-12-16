@@ -74,7 +74,7 @@ def train_pytorch_model(model, dataloaders, learning_rates, output_dir, num_epoc
         spec_epoch_dir = output_dir / 'spectrograms_per_epoch'
         spec_epoch_dir.mkdir(parents=True, exist_ok=True)
 
-    noise_levels = ['clean', '20dB', '15dB', '10dB', '5dB']
+    noise_levels = ['clean', '25dB', '20dB', '15dB', '10dB', '5dB']
     global_epoch = 0
 
     for level in noise_levels:
